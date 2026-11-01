@@ -1,0 +1,14 @@
+{
+  "name": "payment-idempotency-service",
+  "version": "1.0.0",
+  "description": "Express backend payment service with idempotency key enforcement and duplicate charge prevention",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "author": "",
+  "license": "CC0-1.0",
+  "dependencies": {
+    "express": "^5.3.0"
+  }
+}

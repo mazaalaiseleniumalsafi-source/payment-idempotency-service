@@ -1,0 +1,127 @@
+name: Payment Idempotency CI/CD Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  verify-idempotency:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Start payment service
+        run: |
+          node server.js &
+          # Poll health endpoint until service is ready
+          for i in {1..15}; do
+            if curl -s -f http://localhost:3000/api/health > /dev/null; then
+              echo "Payment service is online and healthy."
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run Idempotency Gate Verification
+        run: |
+          set -e
+
+          echo "=== 1. Test POST without Idempotency-Key (Expect HTTP 400) ==="
+          HTTP_NO_KEY=$(curl -s -D headers_1.txt -o body_1.json -w "%{http_code}" -X POST http://localhost:3000/api/v1/charges \
+            -H "Content-Type: application/json" \
+            -d '{"amount": 5000}')
+          echo "Status: $HTTP_NO_KEY"
+          cat body_1.json
+          if [ "$HTTP_NO_KEY" -ne 400 ]; then
+            echo "FAILED: Expected HTTP 400 when Idempotency-Key is missing, got $HTTP_NO_KEY"
+            exit 1
+          fi
+
+          echo "=== 2. Test Initial Charge with Idempotency-Key (Expect HTTP 201) ==="
+          HTTP_FIRST=$(curl -s -D headers_2.txt -o body_2.json -w "%{http_code}" -X POST http://localhost:3000/api/v1/charges \
+            -H "Content-Type: application/json" \
+            -H "Idempotency-Key: idem-key-101" \
+            -d '{"amount": 5000}')
+          echo "Status: $HTTP_FIRST"
+          cat body_2.json
+          if [ "$HTTP_FIRST" -ne 201 ]; then
+            echo "FAILED: Expected HTTP 201 for initial charge, got $HTTP_FIRST"
+            exit 1
+          fi
+          TXN_1=$(node -p "require('./body_2.json').transactionId")
+          echo "Generated Transaction ID: $TXN_1"
+
+          echo "=== 3. Test Duplicate Charge Retry with same Key (Expect HTTP 200) ==="
+          HTTP_RETRY=$(curl -s -D headers_3.txt -o body_3.json -w "%{http_code}" -X POST http://localhost:3000/api/v1/charges \
+            -H "Content-Type: application/json" \
+            -H "Idempotency-Key: idem-key-101" \
+            -d '{"amount": 5000}')
+          echo "Status: $HTTP_RETRY"
+          cat body_3.json
+          if [ "$HTTP_RETRY" -ne 200 ]; then
+            echo "FAILED: Expected HTTP 200 for replayed charge, got $HTTP_RETRY"
+            exit 1
+          fi
+          TXN_2=$(node -p "require('./body_3.json').transactionId")
+          echo "Replayed Transaction ID: $TXN_2"
+
+          if [ "$TXN_1" != "$TXN_2" ]; then
+            echo "FAILED: Transaction IDs do not match! Duplicate charge created."
+            exit 1
+          fi
+
+          echo "=== Generating Idempotency Audit Report ==="
+          node -e '
+            const fs = require("fs");
+            const report = {
+              timestamp: new Date().toISOString(),
+              testSuite: "Automated Payment Idempotency & Duplicate Prevention Gate",
+              service: "payment-idempotency-service",
+              checks: {
+                missingKeyValidation: {
+                  passed: true,
+                  expectedStatus: 400,
+                  actualStatus: 400
+                },
+                initialChargeExecution: {
+                  passed: true,
+                  expectedStatus: 201,
+                  actualStatus: 201,
+                  transactionId: process.argv[1]
+                },
+                duplicateRetryPrevention: {
+                  passed: true,
+                  expectedStatus: 200,
+                  actualStatus: 200,
+                  replayedTransactionId: process.argv[2],
+                  idempotentMatch: true
+                }
+              },
+              overallStatus: "PASSED",
+              recommendation: "Safe to merge; duplicate billing prevention verified."
+            };
+            fs.writeFileSync("idempotency-audit-report.json", JSON.stringify(report, null, 2));
+          ' "$TXN_1" "$TXN_2"
+
+          cat idempotency-audit-report.json
+
+      - name: Upload Idempotency Audit Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: idempotency-audit-report
+          path: idempotency-audit-report.json
+          if-no-files-found: error
